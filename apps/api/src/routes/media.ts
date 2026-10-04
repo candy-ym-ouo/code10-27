@@ -5,8 +5,8 @@ import { z } from "zod";
 import { getConfig } from "../config/env.js";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
-import { enqueueProbe } from "../lib/queue.js";
-import { createPlaybackUrl, createUploadUrl, deleteObject, verifyObject } from "../lib/s3.js";
+import { enqueueObjectSweep, enqueueProbe } from "../lib/queue.js";
+import { createPlaybackUrl, createUploadUrl, verifyObject } from "../lib/s3.js";
 import { parseOrThrow } from "../lib/validation.js";
 import { audit } from "../lib/audit.js";
 
@@ -74,39 +74,59 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
       orderBy: { processedAt: "desc" },
     });
     if (reusable) {
-      const media = await prisma.mediaAsset.create({
-        data: {
-          userId: request.authUser!.id,
-          sessionId,
-          status: "READY",
-          objectKey: reusable.objectKey,
-          originalName: input.originalName,
-          mimeType: input.mimeType,
-          sizeBytes: input.sizeBytes,
-          sha256: reusable.sha256,
-          durationMs: reusable.durationMs,
-          codec: reusable.codec,
-          sampleRate: reusable.sampleRate,
-          channels: reusable.channels,
-          peaks: reusable.peaks ?? undefined,
-          uploadedAt: new Date(),
-          processedAt: new Date(),
-        },
-        select: {
-          id: true,
-          status: true,
-          originalName: true,
-          mimeType: true,
-          sizeBytes: true,
-          durationMs: true,
-          codec: true,
-          sampleRate: true,
-          channels: true,
-          peaks: true,
-          failureCode: true,
-          failureMessage: true,
-          createdAt: true,
-        },
+      // 与练习删除 / 单条删除共用 media_objects 行锁：事务开始即 FOR UPDATE，
+      // 若该 key 正处于删除事务中，本事务等待其提交后再读到最终状态，
+      // 消除"删除事务已墓碑化、复用事务却插入引用"的交错窗口。
+      const media = await prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw<Array<{ id: string; status: string }>>`
+          SELECT "id", "status" FROM "media_objects"
+          WHERE "object_key" = ${reusable.objectKey}
+          FOR UPDATE`;
+        const object = locked[0];
+        if (!object) throw new AppError(503, "MEDIA_TEMPORARILY_UNAVAILABLE", "音频正在删除收尾，请稍后重试");
+        if (object.status === "DELETE_PENDING") {
+          // 对象在上一事务中被墓碑化但尚未物理删除，新引用到达则将其复活；
+          // 清扫任务持有的也是行锁，必须等本事务提交后才能继续，
+          // 届时会因引用数 > 0 跳过删除。
+          await tx.mediaObject.update({
+            where: { id: object.id },
+            data: { status: "ACTIVE", deleteRequestedAt: null, deleteAttempts: 0, lastDeleteError: null },
+          });
+        }
+        return tx.mediaAsset.create({
+          data: {
+            userId: request.authUser!.id,
+            sessionId,
+            status: "READY",
+            objectKey: reusable.objectKey,
+            originalName: input.originalName,
+            mimeType: input.mimeType,
+            sizeBytes: input.sizeBytes,
+            sha256: reusable.sha256,
+            durationMs: reusable.durationMs,
+            codec: reusable.codec,
+            sampleRate: reusable.sampleRate,
+            channels: reusable.channels,
+            peaks: reusable.peaks ?? undefined,
+            uploadedAt: new Date(),
+            processedAt: new Date(),
+          },
+          select: {
+            id: true,
+            status: true,
+            originalName: true,
+            mimeType: true,
+            sizeBytes: true,
+            durationMs: true,
+            codec: true,
+            sampleRate: true,
+            channels: true,
+            peaks: true,
+            failureCode: true,
+            failureMessage: true,
+            createdAt: true,
+          },
+        });
       });
       return reply.status(201).send({ media, reused: true, uploadUrl: null, requiredHeaders: {}, expiresAt: null });
     }
@@ -114,20 +134,31 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const mediaId = randomUUID();
     const objectKey = `users/${request.authUser!.id}/sessions/${sessionId}/${mediaId}/${safeFileName(input.originalName)}`;
     const uploadUrl = await createUploadUrl(objectKey, input.mimeType, input.sha256.toLowerCase());
-    const media = await prisma.mediaAsset.create({
-      data: {
-        id: mediaId,
-        userId: request.authUser!.id,
-        sessionId,
-        status: "PENDING_UPLOAD",
-        objectKey,
-        originalName: input.originalName,
-        mimeType: input.mimeType,
-        sizeBytes: input.sizeBytes,
-        sha256: input.sha256.toLowerCase(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60_000),
-      },
-      select: { id: true, status: true, originalName: true, sizeBytes: true, createdAt: true },
+    const media = await prisma.$transaction(async (tx) => {
+      // 先登记物理对象，media_assets 通过外键引用它（NO ACTION 防止有引用时误删登记行）。
+      await tx.mediaObject.create({
+        data: {
+          id: mediaId,
+          userId: request.authUser!.id,
+          objectKey,
+          sha256: input.sha256.toLowerCase(),
+        },
+      });
+      return tx.mediaAsset.create({
+        data: {
+          id: mediaId,
+          userId: request.authUser!.id,
+          sessionId,
+          status: "PENDING_UPLOAD",
+          objectKey,
+          originalName: input.originalName,
+          mimeType: input.mimeType,
+          sizeBytes: input.sizeBytes,
+          sha256: input.sha256.toLowerCase(),
+          expiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+        },
+        select: { id: true, status: true, originalName: true, sizeBytes: true, createdAt: true },
+      });
     });
 
     return reply.status(201).send({
@@ -232,9 +263,26 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const { mediaId } = request.params as { mediaId: string };
     const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
     if (!media) throw notFound();
-    const referenceCount = await prisma.mediaAsset.count({ where: { objectKey: media.objectKey } });
-    if (referenceCount === 1) await deleteObject(media.objectKey);
-    await prisma.mediaAsset.delete({ where: { id: media.id } });
+    // 与练习清理相同的两阶段协议：行锁 + 引用计数在同一事务内完成，
+    // 修复原先"先 count 再删"在并发删除 / 并发复用上传下的竞态
+    // （两个删除者都看到 refcount=1 → 都不删 S3 → 孤儿对象）。
+    let tombstoned = false;
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT "id" FROM "media_objects" WHERE "object_key" = ${media.objectKey} FOR UPDATE`;
+      await tx.mediaAsset.delete({ where: { id: media.id } });
+      const remaining = await tx.mediaAsset.count({ where: { objectKey: media.objectKey } });
+      if (remaining === 0) {
+        await tx.mediaObject.update({
+          where: { objectKey: media.objectKey },
+          data: { status: "DELETE_PENDING", deleteRequestedAt: new Date(), lastDeleteError: null },
+        });
+        tombstoned = true;
+      }
+    });
+    if (tombstoned) {
+      // 物理删除失败不影响接口结果：墓碑已持久化，清扫任务会持续重试。
+      await enqueueObjectSweep().catch(() => undefined);
+    }
     await audit(request, "MEDIA_DELETED", "MEDIA_ASSET", media.id, "SUCCESS");
     return { success: true };
   });

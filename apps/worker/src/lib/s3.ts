@@ -37,3 +37,25 @@ export async function putObject(objectKey: string, body: string, contentType: st
 export async function deleteObject(objectKey: string): Promise<void> {
   await getS3().send(new DeleteObjectCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey }));
 }
+
+/** 判断 S3 错误是否表示对象已不存在（清扫重试时视为成功，使物理删除幂等）。 */
+export function isObjectNotFound(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const status = (error as { $metadata?: { httpStatusCode?: number }; statusCode?: number }).$metadata?.httpStatusCode
+    ?? (error as { statusCode?: number }).statusCode;
+  const code = (error as { name?: string; Code?: string }).name ?? (error as { Code?: string }).Code;
+  return status === 404 || code === "NoSuchKey" || code === "NotFound";
+}
+
+/**
+ * 幂等删除：对象不存在时不报错。墓碑清扫路径使用该函数，
+ * 保证"上一轮已删掉 S3 对象但登记行尚未删除就崩溃"的情况下重试仍然成功。
+ */
+export async function deleteObjectIfExists(objectKey: string): Promise<void> {
+  try {
+    await deleteObject(objectKey);
+  } catch (error) {
+    if (isObjectNotFound(error)) return;
+    throw error;
+  }
+}

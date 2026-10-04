@@ -36,6 +36,7 @@
 - 探测成功率和失败原因。
 - `worker:heartbeat` Redis Key，正常每 10 秒刷新，TTL 30 秒。
 - `DELETE_FAILED` 练习和导出任务积压。
+- `media_objects` 中长期处于 `DELETE_PENDING` 的记录（关注 `delete_attempts` 与 `last_delete_error`，通常意味着对象存储持续不可用或权限配置错误；清扫任务每 5 分钟自动重试，无需人工介入，持续积压才需排查）。
 
 ## 发布回滚
 

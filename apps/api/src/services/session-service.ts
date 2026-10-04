@@ -185,6 +185,13 @@ export async function requestSessionDeletion(userId: string, sessionId: string, 
   if (confirmationTitle !== session.title) {
     throw new AppError(400, "CONFIRMATION_MISMATCH", "请输入完整练习标题以确认删除");
   }
+  if (session.status === "DELETING") {
+    // 删除任务已在队列/重试中，重复请求直接幂等返回，不产生并发清理。
+    return { success: true, sessionId, status: "DELETING" as const };
+  }
+  if (session.status !== "DELETE_FAILED" && !["DRAFT", "IN_REVIEW", "COMPLETED", "ARCHIVED"].includes(session.status)) {
+    throw new AppError(409, "INVALID_SESSION_STATE", "当前练习状态不能删除");
+  }
   await prisma.practiceSession.update({
     where: { id: sessionId },
     data: { status: "DELETING", version: { increment: 1 } },
@@ -192,6 +199,9 @@ export async function requestSessionDeletion(userId: string, sessionId: string, 
   try {
     await enqueueCleanup(sessionId);
   } catch {
+    // 入队失败必须回退到 DELETE_FAILED，避免练习停在 DELETING 却没有任务处理；
+    // 用户重新发起删除即可重试（稳定 jobId 保证不会重复清理）。
+    await prisma.practiceSession.updateMany({ where: { id: sessionId }, data: { status: "DELETE_FAILED" } });
     throw new AppError(503, "PROCESSING_UNAVAILABLE", "删除任务暂时不可用，请稍后重试");
   }
   return { success: true, sessionId, status: "DELETING" as const };
