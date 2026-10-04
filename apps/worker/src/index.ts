@@ -10,6 +10,7 @@ import { prisma } from "./lib/prisma.js";
 import { deleteObject, getObjectStream, putObject } from "./lib/s3.js";
 import { generatePeaks, probeAudio } from "./lib/media.js";
 import { buildUserExport } from "./lib/export.js";
+import { cleanupSession as cleanupSessionDb, reapPendingDeletions } from "./lib/cleanup.js";
 
 const config = getConfig();
 const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
@@ -76,23 +77,20 @@ async function processMedia(mediaId: string) {
 }
 
 async function cleanupSession(sessionId: string) {
-  const session = await prisma.practiceSession.findUnique({
-    where: { id: sessionId },
-    include: { mediaAssets: { select: { objectKey: true } } },
-  });
-  if (!session) return;
-  try {
-    const keys = new Set(session.mediaAssets.map((media) => media.objectKey));
-    for (const objectKey of keys) {
-      const references = await prisma.mediaAsset.count({ where: { objectKey, sessionId: { not: sessionId } } });
-      if (references === 0) await deleteObject(objectKey);
-    }
-    await prisma.practiceSession.delete({ where: { id: sessionId } });
-    log("info", { sessionId }, "session cleanup completed");
-  } catch (error) {
-    await prisma.practiceSession.updateMany({ where: { id: sessionId }, data: { status: "DELETE_FAILED" } });
-    throw error;
-  }
+  await cleanupSessionDb(
+    {
+      db: prisma,
+      deleteObject,
+      markDeleteFailed: async (id) => {
+        await prisma.practiceSession.updateMany({
+          where: { id },
+          data: { status: "DELETE_FAILED" },
+        });
+      },
+    },
+    sessionId,
+  );
+  log("info", { sessionId }, "session cleanup completed");
 }
 
 async function exportData(exportId: string) {
@@ -148,10 +146,23 @@ const overdueInterval = setInterval(() => {
   void scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
 }, 24 * 60 * 60_000);
 
+// 定期清理待删除对象：兜底任务进程在“事务提交后、对象删除前”崩溃的
+// 场景，使孤儿对象最终一定被回收；对象被新练习复用时自动取消删除。
+async function sweepPendingDeletions() {
+  try {
+    await reapPendingDeletions({ db: prisma, deleteObject, markDeleteFailed: async () => undefined });
+  } catch (error) {
+    log("error", { err: error instanceof Error ? error.message : String(error) }, "pending deletion sweep failed");
+  }
+}
+await sweepPendingDeletions();
+const sweepInterval = setInterval(() => void sweepPendingDeletions(), 5 * 60_000);
+
 async function shutdown(signal: string) {
   log("info", { signal }, "shutting down worker");
   clearInterval(heartbeat);
   clearInterval(overdueInterval);
+  clearInterval(sweepInterval);
   await worker.close();
   await redis.quit();
   await prisma.$disconnect();

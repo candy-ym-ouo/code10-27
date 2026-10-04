@@ -6,7 +6,8 @@ import { getConfig } from "../config/env.js";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { enqueueProbe } from "../lib/queue.js";
-import { createPlaybackUrl, createUploadUrl, deleteObject, verifyObject } from "../lib/s3.js";
+import { createPlaybackUrl, createUploadUrl, verifyObject } from "../lib/s3.js";
+import { lockObjectKeys, sortedUniqueObjectKeys } from "../lib/object-locks.js";
 import { parseOrThrow } from "../lib/validation.js";
 import { audit } from "../lib/audit.js";
 
@@ -69,46 +70,70 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(413, "SESSION_SIZE_LIMIT_REACHED", `单次练习音频总量不能超过 ${config.MAX_SESSION_TOTAL_MB} MB`);
     }
 
+    // 只复用仍属于“未在删除”的练习的音频：正在删除的练习可能已经登记
+    // 对象删除意图，此时复用会把新练习关联到一个即将被回收的对象。
     const reusable = await prisma.mediaAsset.findFirst({
-      where: { userId: request.authUser!.id, sha256: input.sha256.toLowerCase(), status: "READY" },
+      where: {
+        userId: request.authUser!.id,
+        sha256: input.sha256.toLowerCase(),
+        status: "READY",
+        session: { status: { notIn: ["DELETING", "DELETE_FAILED"] } },
+      },
       orderBy: { processedAt: "desc" },
     });
     if (reusable) {
-      const media = await prisma.mediaAsset.create({
-        data: {
-          userId: request.authUser!.id,
-          sessionId,
-          status: "READY",
-          objectKey: reusable.objectKey,
-          originalName: input.originalName,
-          mimeType: input.mimeType,
-          sizeBytes: input.sizeBytes,
-          sha256: reusable.sha256,
-          durationMs: reusable.durationMs,
-          codec: reusable.codec,
-          sampleRate: reusable.sampleRate,
-          channels: reusable.channels,
-          peaks: reusable.peaks ?? undefined,
-          uploadedAt: new Date(),
-          processedAt: new Date(),
-        },
-        select: {
-          id: true,
-          status: true,
-          originalName: true,
-          mimeType: true,
-          sizeBytes: true,
-          durationMs: true,
-          codec: true,
-          sampleRate: true,
-          channels: true,
-          peaks: true,
-          failureCode: true,
-          failureMessage: true,
-          createdAt: true,
-        },
+      // 与 Worker 删除事务争夺同一把对象咨询锁并在锁内复查来源仍然有效，
+      // 关闭“查找到可复用对象”与“创建引用”之间的并发删除窗口。
+      const objectKeys = sortedUniqueObjectKeys([reusable.objectKey]);
+      const media = await prisma.$transaction(async (tx) => {
+        await lockObjectKeys(tx, objectKeys);
+        const stillReusable = await tx.mediaAsset.findFirst({
+          where: {
+            id: reusable.id,
+            status: "READY",
+            session: { status: { notIn: ["DELETING", "DELETE_FAILED"] } },
+          },
+        });
+        if (!stillReusable) return null;
+        return tx.mediaAsset.create({
+          data: {
+            userId: request.authUser!.id,
+            sessionId,
+            status: "READY",
+            objectKey: stillReusable.objectKey,
+            originalName: input.originalName,
+            mimeType: input.mimeType,
+            sizeBytes: input.sizeBytes,
+            sha256: stillReusable.sha256,
+            durationMs: stillReusable.durationMs,
+            codec: stillReusable.codec,
+            sampleRate: stillReusable.sampleRate,
+            channels: stillReusable.channels,
+            peaks: stillReusable.peaks ?? undefined,
+            uploadedAt: new Date(),
+            processedAt: new Date(),
+          },
+          select: {
+            id: true,
+            status: true,
+            originalName: true,
+            mimeType: true,
+            sizeBytes: true,
+            durationMs: true,
+            codec: true,
+            sampleRate: true,
+            channels: true,
+            peaks: true,
+            failureCode: true,
+            failureMessage: true,
+            createdAt: true,
+          },
+        });
       });
-      return reply.status(201).send({ media, reused: true, uploadUrl: null, requiredHeaders: {}, expiresAt: null });
+      if (media) {
+        return reply.status(201).send({ media, reused: true, uploadUrl: null, requiredHeaders: {}, expiresAt: null });
+      }
+      // 来源恰好在并发删除，退化为普通直传流程，生成全新对象。
     }
 
     const mediaId = randomUUID();
@@ -232,9 +257,24 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const { mediaId } = request.params as { mediaId: string };
     const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
     if (!media) throw notFound();
-    const referenceCount = await prisma.mediaAsset.count({ where: { objectKey: media.objectKey } });
-    if (referenceCount === 1) await deleteObject(media.objectKey);
-    await prisma.mediaAsset.delete({ where: { id: media.id } });
+    // 与练习删除、复用新建共用同一把对象咨询锁：锁内统计引用、删除素材行，
+    // 避免与并发删除互相误判引用计数。对象不在此处直接删除，而是写入待
+    // 删除意图，由 Worker 事务外删除并在删除前再次确认引用，失败可重试，
+    // 既不会误删被其他练习引用的对象，也不会遗留孤儿对象。
+    await prisma.$transaction(async (tx) => {
+      await lockObjectKeys(tx, sortedUniqueObjectKeys([media.objectKey]));
+      const referenceCount = await tx.mediaAsset.count({
+        where: { objectKey: media.objectKey, userId: request.authUser!.id },
+      });
+      await tx.mediaAsset.delete({ where: { id: media.id } });
+      if (referenceCount === 1) {
+        await tx.pendingObjectDeletion.upsert({
+          where: { objectKey: media.objectKey },
+          create: { userId: request.authUser!.id, objectKey: media.objectKey },
+          update: {},
+        });
+      }
+    });
     await audit(request, "MEDIA_DELETED", "MEDIA_ASSET", media.id, "SUCCESS");
     return { success: true };
   });

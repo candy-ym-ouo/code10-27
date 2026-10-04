@@ -95,6 +95,7 @@ model User {
   refreshSessions   RefreshSession[]
   practiceSessions  PracticeSession[]
   mediaAssets       MediaAsset[]
+  pendingObjectDeletions PendingObjectDeletion[]
   annotations       Annotation[]
   goals             Goal[]
   goalProgresses    GoalProgress[]
@@ -184,6 +185,24 @@ model MediaAsset {
   @@index([sessionId, status])
   @@index([expiresAt])
   @@map("media_assets")
+}
+
+/// S3 对象删除的持久化意图。在删除引用对象的练习事务中原子写入，
+/// 由 Worker 在事务外安全地删除对象，支持崩溃/失败后重试，并在删除前
+/// 再次确认没有其他练习引用，避免误删共享对象。
+model PendingObjectDeletion {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  objectKey      String   @unique @map("object_key")
+  attempts       Int      @default(0)
+  lastError      String?  @map("last_error") @db.VarChar(500)
+  nextAttemptAt  DateTime @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([nextAttemptAt])
+  @@map("pending_object_deletions")
 }
 
 model Annotation {

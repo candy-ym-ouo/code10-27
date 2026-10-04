@@ -36,6 +36,7 @@
 - 探测成功率和失败原因。
 - `worker:heartbeat` Redis Key，正常每 10 秒刷新，TTL 30 秒。
 - `DELETE_FAILED` 练习和导出任务积压。
+- `pending_object_deletions` 表积压（可按 `next_attempt_at` 到期数量告警），持续增长通常表示对象存储不可达或清理逻辑异常。
 
 ## 发布回滚
 
